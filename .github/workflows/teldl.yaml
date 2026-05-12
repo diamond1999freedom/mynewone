@@ -1,0 +1,321 @@
+name: 'teldl'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+on:
+  workflow_dispatch:
+    inputs:
+      telegram_url:
+        required: true
+        type: string
+        description: 'Telegram public channel post URL (e.g., https://t.me/channel/123)'
+      folder_name:
+        required: true
+        type: string
+        description: 'Folder name to store the files'
+      debug:
+        required: false
+        type: boolean
+        default: false
+        description: 'Enable debug mode'
+
+permissions:
+  contents: write
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+      
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          if [ "${{ github.event.inputs.debug }}" != "true" ]; then
+            exec 2>&1 > /tmp/setup.log
+          fi
+          set +x
+          
+          echo "::add-mask::${{ github.event.inputs.telegram_url }}"
+          echo "::add-mask::${{ github.event.inputs.folder_name }}"
+          
+          {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq aria2 ffmpeg atomicparsley
+            pip install --quiet --upgrade pip
+            pip install --quiet yt-dlp
+          } > /dev/null 2>&1
+
+      - name: Setup git
+        run: |
+          set +x
+          
+          {
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config http.postBuffer 1048576000
+            git config http.version HTTP/1.1
+            git config core.compression 0
+            git config pack.windowMemory 100m
+            git config pack.threads 1
+          } > /dev/null 2>&1
+
+      - name: Download from Telegram
+        run: |
+          if [ "${{ github.event.inputs.debug }}" != "true" ]; then
+            exec 2>&1 > /tmp/download.log
+          fi
+          set +x
+          
+          URL="${{ github.event.inputs.telegram_url }}"
+          FOLDER="${{ github.event.inputs.folder_name }}"
+          
+          # Create temp download directory
+          mkdir -p tmp_download
+          cd tmp_download
+          
+          # Download with yt-dlp (supports Telegram)
+          retry=0
+          max_retry=5
+          
+          until [ $retry -ge $max_retry ]; do
+            {
+              yt-dlp \
+                --quiet \
+                --no-warnings \
+                --no-progress \
+                --retries 10 \
+                --fragment-retries 10 \
+                --file-access-retries 5 \
+                --concurrent-fragments 4 \
+                --downloader aria2c \
+                --downloader-args "aria2c:-x 16 -s 16 -k 1M --file-allocation=none" \
+                --output "downloaded_file.%(ext)s" \
+                "$URL"
+            } > /dev/null 2>&1 && break
+            
+            retry=$((retry+1))
+            [ $retry -lt $max_retry ] && sleep 5
+          done
+          
+          # Find the downloaded file
+          DOWNLOADED_FILE=$(find . -type f -name "downloaded_file.*" | head -1)
+          
+          if [ -z "$DOWNLOADED_FILE" ] || [ ! -s "$DOWNLOADED_FILE" ]; then
+            echo "Download failed"
+            exit 1
+          fi
+          
+          # Get file extension and create clean filename
+          EXT="${DOWNLOADED_FILE##*.}"
+          mv "$DOWNLOADED_FILE" "../t.${EXT}" > /dev/null 2>&1
+          
+          cd ..
+          rm -rf tmp_download
+          
+          # Save metadata
+          echo "FOLDER=${FOLDER}" >> $GITHUB_ENV
+          echo "EXTENSION=${EXT}" >> $GITHUB_ENV
+
+      - name: Process and split file
+        run: |
+          if [ "${{ github.event.inputs.debug }}" != "true" ]; then
+            exec 2>&1 > /tmp/process.log
+          fi
+          set +x
+          
+          FOLDER="${{ env.FOLDER }}"
+          EXT="${{ env.EXTENSION }}"
+          
+          # Find the downloaded file
+          DOWNLOADED=$(find . -maxdepth 1 -type f -name "t.*" | head -1)
+          
+          if [ -z "$DOWNLOADED" ] || [ ! -s "$DOWNLOADED" ]; then
+            echo "No file to process"
+            exit 1
+          fi
+          
+          # Get file size
+          FILE_SIZE=$(stat -c%s "$DOWNLOADED" 2>/dev/null || stat -f%z "$DOWNLOADED" 2>/dev/null)
+          SIZE_MB=$((FILE_SIZE / 1024 / 1024))
+          
+          # Create destination directory
+          mkdir -p "telegram_media/${FOLDER}"
+          
+          # If file is smaller than 45MB, just move it directly
+          if [ $SIZE_MB -lt 45 ]; then
+            {
+              mv "$DOWNLOADED" "telegram_media/${FOLDER}/${FOLDER}.${EXT}"
+              echo "SPLIT=false" >> $GITHUB_ENV
+              echo "PARTS=1" >> $GITHUB_ENV
+            } > /dev/null 2>&1
+          else
+            # File is large, zip and split
+            {
+              # Zip with no compression for speed
+              zip -0 -q "${FOLDER}.z" "$DOWNLOADED"
+              
+              # Verify zip creation
+              if [ ! -f "${FOLDER}.z" ] || [ ! -s "${FOLDER}.z" ]; then
+                echo "Zip creation failed"
+                exit 1
+              fi
+              
+              # Remove original
+              rm -f "$DOWNLOADED"
+              
+              # Split into 49MB chunks
+              split -b 49M -d -a 3 "${FOLDER}.z" "telegram_media/${FOLDER}/${FOLDER}.z.part_"
+              
+              # Rename parts with proper numbering
+              part_num=1
+              for part in telegram_media/${FOLDER}/${FOLDER}.z.part_*; do
+                if [ -f "$part" ]; then
+                  mv "$part" "telegram_media/${FOLDER}/${FOLDER}.z.$(printf '%03d' $part_num)"
+                  part_num=$((part_num+1))
+                fi
+              done
+              
+              total_parts=$((part_num-1))
+              
+              # Verify parts were created
+              if [ $total_parts -eq 0 ]; then
+                echo "No parts created"
+                exit 1
+              fi
+              
+              # Create metadata file
+              cat > "telegram_media/${FOLDER}/meta.txt" << EOF
+filename=${FOLDER}
+parts=${total_parts}
+extension=${EXT}
+size=${FILE_SIZE}
+source=${{ github.event.inputs.telegram_url }}
+date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+EOF
+              
+              # Create reconstruction script
+              cat > "telegram_media/${FOLDER}/reconstruct.sh" << 'SCRIPT'
+#!/bin/bash
+# Reconstruction script
+FOLDER=$(basename "$(dirname "$0")")
+cat ${FOLDER}.z.* > ${FOLDER}.z
+unzip -q ${FOLDER}.z
+rm ${FOLDER}.z
+echo "File reconstructed successfully"
+SCRIPT
+              
+              chmod +x "telegram_media/${FOLDER}/reconstruct.sh"
+              
+              # Remove temporary zip
+              rm -f "${FOLDER}.z"
+              
+              echo "SPLIT=true" >> $GITHUB_ENV
+              echo "PARTS=${total_parts}" >> $GITHUB_ENV
+              
+            } > /dev/null 2>&1
+          fi
+
+      - name: Create index
+        run: |
+          set +x
+          
+          {
+            # Create or update index file
+            INDEX_FILE="telegram_media/INDEX.md"
+            
+            if [ ! -f "$INDEX_FILE" ]; then
+              cat > "$INDEX_FILE" << 'HEADER'
+# Telegram Media Archive
+
+| Folder | Parts | Size | Extension | Date | Source |
+|--------|-------|------|-----------|------|--------|
+HEADER
+            fi
+            
+            FOLDER="${{ env.FOLDER }}"
+            PARTS="${{ env.PARTS }}"
+            EXT="${{ env.EXTENSION }}"
+            SPLIT="${{ env.SPLIT }}"
+            
+            if [ -f "telegram_media/${FOLDER}/meta.txt" ]; then
+              SIZE=$(grep "^size=" "telegram_media/${FOLDER}/meta.txt" | cut -d= -f2)
+              SIZE_MB=$((SIZE / 1024 / 1024))
+            else
+              SIZE_MB="<45"
+            fi
+            
+            SPLIT_STATUS=$([ "$SPLIT" = "true" ] && echo "✂️ Split" || echo "📄 Single")
+            DATE=$(date -u +%Y-%m-%d)
+            
+            echo "| ${FOLDER} | ${PARTS} ${SPLIT_STATUS} | ${SIZE_MB}MB | .${EXT} | ${DATE} | [Link](${{ github.event.inputs.telegram_url }}) |" >> "$INDEX_FILE"
+            
+          } > /dev/null 2>&1
+
+      - name: Commit and push
+        run: |
+          if [ "${{ github.event.inputs.debug }}" != "true" ]; then
+            exec 2>&1 > /tmp/push.log
+          fi
+          set +x
+          
+          FOLDER="${{ env.FOLDER }}"
+          PARTS="${{ env.PARTS }}"
+          
+          {
+            git add telegram_media/
+          } > /dev/null 2>&1
+          
+          # Check if there are changes
+          if git diff --staged --quiet > /dev/null 2>&1; then
+            echo "No changes to commit"
+            exit 0
+          fi
+          
+          # Commit
+          {
+            git commit -m "Add Telegram media: ${FOLDER} (${PARTS} parts) [skip ci]" --quiet
+          } > /dev/null 2>&1
+          
+          # Push with retry and rebase
+          retry=0
+          max_retry=5
+          
+          until [ $retry -ge $max_retry ]; do
+            if git push origin main --quiet --no-progress > /dev/null 2>&1; then
+              echo "Upload successful: ${FOLDER}"
+              exit 0
+            fi
+            
+            retry=$((retry+1))
+            
+            if [ $retry -lt $max_retry ]; then
+              {
+                git pull --rebase --autostash origin main --quiet
+                sleep $((retry * 3))
+              } > /dev/null 2>&1
+            fi
+          done
+          
+          echo "Push failed after $max_retry attempts"
+          exit 1
+
+      - name: Cleanup
+        if: always()
+        run: |
+          set +x
+          {
+            rm -rf tmp_download t.* *.z
+            rm -f /tmp/*.log
+            find . -name "*.tmp" -delete
+          } > /dev/null 2>&1 || true
