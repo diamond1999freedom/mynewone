@@ -1,4 +1,4 @@
-name: 'teldl'
+name: 'Telegram Media Fetcher'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -80,11 +80,9 @@ jobs:
           URL="${{ github.event.inputs.telegram_url }}"
           FOLDER="${{ github.event.inputs.folder_name }}"
           
-          # Create temp download directory
           mkdir -p tmp_download
           cd tmp_download
           
-          # Download with yt-dlp (supports Telegram)
           retry=0
           max_retry=5
           
@@ -108,7 +106,6 @@ jobs:
             [ $retry -lt $max_retry ] && sleep 5
           done
           
-          # Find the downloaded file
           DOWNLOADED_FILE=$(find . -type f -name "downloaded_file.*" | head -1)
           
           if [ -z "$DOWNLOADED_FILE" ] || [ ! -s "$DOWNLOADED_FILE" ]; then
@@ -116,14 +113,12 @@ jobs:
             exit 1
           fi
           
-          # Get file extension and create clean filename
           EXT="${DOWNLOADED_FILE##*.}"
           mv "$DOWNLOADED_FILE" "../t.${EXT}" > /dev/null 2>&1
           
           cd ..
           rm -rf tmp_download
           
-          # Save metadata
           echo "FOLDER=${FOLDER}" >> $GITHUB_ENV
           echo "EXTENSION=${EXT}" >> $GITHUB_ENV
 
@@ -137,7 +132,6 @@ jobs:
           FOLDER="${{ env.FOLDER }}"
           EXT="${{ env.EXTENSION }}"
           
-          # Find the downloaded file
           DOWNLOADED=$(find . -maxdepth 1 -type f -name "t.*" | head -1)
           
           if [ -z "$DOWNLOADED" ] || [ ! -s "$DOWNLOADED" ]; then
@@ -145,14 +139,11 @@ jobs:
             exit 1
           fi
           
-          # Get file size
           FILE_SIZE=$(stat -c%s "$DOWNLOADED" 2>/dev/null || stat -f%z "$DOWNLOADED" 2>/dev/null)
           SIZE_MB=$((FILE_SIZE / 1024 / 1024))
           
-          # Create destination directory
           mkdir -p "telegram_media/${FOLDER}"
           
-          # If file is smaller than 45MB, just move it directly
           if [ $SIZE_MB -lt 45 ]; then
             {
               mv "$DOWNLOADED" "telegram_media/${FOLDER}/${FOLDER}.${EXT}"
@@ -160,24 +151,18 @@ jobs:
               echo "PARTS=1" >> $GITHUB_ENV
             } > /dev/null 2>&1
           else
-            # File is large, zip and split
             {
-              # Zip with no compression for speed
               zip -0 -q "${FOLDER}.z" "$DOWNLOADED"
               
-              # Verify zip creation
               if [ ! -f "${FOLDER}.z" ] || [ ! -s "${FOLDER}.z" ]; then
                 echo "Zip creation failed"
                 exit 1
               fi
               
-              # Remove original
               rm -f "$DOWNLOADED"
               
-              # Split into 49MB chunks
               split -b 49M -d -a 3 "${FOLDER}.z" "telegram_media/${FOLDER}/${FOLDER}.z.part_"
               
-              # Rename parts with proper numbering
               part_num=1
               for part in telegram_media/${FOLDER}/${FOLDER}.z.part_*; do
                 if [ -f "$part" ]; then
@@ -188,36 +173,31 @@ jobs:
               
               total_parts=$((part_num-1))
               
-              # Verify parts were created
               if [ $total_parts -eq 0 ]; then
                 echo "No parts created"
                 exit 1
               fi
               
-              # Create metadata file
-              cat > "telegram_media/${FOLDER}/meta.txt" << EOF
+              cat > "telegram_media/${FOLDER}/meta.txt" <<METAEOF
 filename=${FOLDER}
 parts=${total_parts}
 extension=${EXT}
 size=${FILE_SIZE}
 source=${{ github.event.inputs.telegram_url }}
 date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-EOF
+METAEOF
               
-              # Create reconstruction script
-              cat > "telegram_media/${FOLDER}/reconstruct.sh" << 'SCRIPT'
+              cat > "telegram_media/${FOLDER}/reconstruct.sh" <<'RECONEOF'
 #!/bin/bash
-# Reconstruction script
 FOLDER=$(basename "$(dirname "$0")")
 cat ${FOLDER}.z.* > ${FOLDER}.z
 unzip -q ${FOLDER}.z
 rm ${FOLDER}.z
 echo "File reconstructed successfully"
-SCRIPT
+RECONEOF
               
               chmod +x "telegram_media/${FOLDER}/reconstruct.sh"
               
-              # Remove temporary zip
               rm -f "${FOLDER}.z"
               
               echo "SPLIT=true" >> $GITHUB_ENV
@@ -231,16 +211,15 @@ SCRIPT
           set +x
           
           {
-            # Create or update index file
             INDEX_FILE="telegram_media/INDEX.md"
             
             if [ ! -f "$INDEX_FILE" ]; then
-              cat > "$INDEX_FILE" << 'HEADER'
+              cat > "$INDEX_FILE" <<'INDEXEOF'
 # Telegram Media Archive
 
 | Folder | Parts | Size | Extension | Date | Source |
 |--------|-------|------|-----------|------|--------|
-HEADER
+INDEXEOF
             fi
             
             FOLDER="${{ env.FOLDER }}"
@@ -255,7 +234,7 @@ HEADER
               SIZE_MB="<45"
             fi
             
-            SPLIT_STATUS=$([ "$SPLIT" = "true" ] && echo "✂️ Split" || echo "📄 Single")
+            SPLIT_STATUS=$([ "$SPLIT" = "true" ] && echo "Split" || echo "Single")
             DATE=$(date -u +%Y-%m-%d)
             
             echo "| ${FOLDER} | ${PARTS} ${SPLIT_STATUS} | ${SIZE_MB}MB | .${EXT} | ${DATE} | [Link](${{ github.event.inputs.telegram_url }}) |" >> "$INDEX_FILE"
@@ -276,18 +255,15 @@ HEADER
             git add telegram_media/
           } > /dev/null 2>&1
           
-          # Check if there are changes
           if git diff --staged --quiet > /dev/null 2>&1; then
             echo "No changes to commit"
             exit 0
           fi
           
-          # Commit
           {
             git commit -m "Add Telegram media: ${FOLDER} (${PARTS} parts) [skip ci]" --quiet
           } > /dev/null 2>&1
           
-          # Push with retry and rebase
           retry=0
           max_retry=5
           
