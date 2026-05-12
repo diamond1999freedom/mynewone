@@ -17,162 +17,105 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 1
       
       - name: setup
         run: |
-          exec 2>/dev/null
           set +x
-          
-          # Mask sensitive inputs
           echo "::add-mask::${{ github.event.inputs.file_url }}"
           echo "::add-mask::${{ github.event.inputs.folder_name }}"
           
-          # Install dependencies silently with retry
-          for i in {1..3}; do
-            if sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq && \
-               sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq aria2 pigz pv 2>&1 | grep -v .; then
-              break
-            fi
-            sleep 2
-          done
-          
-          # Configure git
-          git config --global user.name "x" 2>&1 | grep -v .
-          git config --global user.email "x@x.x" 2>&1 | grep -v .
-          git config --global http.postBuffer 1048576000 2>&1 | grep -v .
-          git config --global http.version HTTP/1.1 2>&1 | grep -v .
-          git config --global core.compression 0 2>&1 | grep -v .
-          git config --global pack.windowMemory 100m 2>&1 | grep -v .
-          git config --global pack.threads 1 2>&1 | grep -v .
+          {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq aria2 pigz
+            
+            git config user.name "x"
+            git config user.email "x@x.x"
+            git config http.postBuffer 1048576000
+            git config http.version HTTP/1.1
+            git config core.compression 0
+          } > /dev/null 2>&1
           
       - name: download
         run: |
-          exec 1>/dev/null 2>/dev/null
           set +x
+          U="${{ github.event.inputs.file_url }}"
+          F="${{ github.event.inputs.folder_name }}"
           
-          u="${{ github.event.inputs.file_url }}"
-          f="${{ github.event.inputs.folder_name }}"
+          RN=$(basename "${U%%\?*}" | sed 's/%20/ /g')
+          FN="${RN}"
           
-          # Extract filename
-          rn=$(basename "${u%%\?*}" | sed 's/%20/ /g' | head -c 255)
-          fn="${rn%.*}.${rn##*.}"
-          
-          # Download with retry and resume capability
-          retry=0
-          max_retry=5
-          until [ $retry -ge $max_retry ]; do
-            if aria2c \
+          {
+            aria2c \
               --max-tries=10 \
               --retry-wait=3 \
-              --max-file-not-found=3 \
               --max-connection-per-server=16 \
               --split=16 \
               --min-split-size=1M \
-              --connect-timeout=30 \
-              --timeout=60 \
+              --connect-timeout=60 \
+              --timeout=120 \
               --file-allocation=none \
               --allow-overwrite=true \
-              --auto-file-renaming=false \
-              --conditional-get=true \
-              --remote-time=true \
               --console-log-level=error \
               --summary-interval=0 \
-              --download-result=hide \
               --disable-ipv6=true \
-              --quiet=true \
-              -o "t" "$u" 2>&1 | grep -v .; then
-              break
-            fi
-            retry=$((retry+1))
-            sleep 5
-          done
+              --continue=true \
+              -o "t" "$U"
+          } > /dev/null 2>&1
           
           if [ ! -f "t" ] || [ ! -s "t" ]; then
             exit 1
           fi
           
-          # Save to environment
-          {
-            echo "FNAME<<EOF"
-            echo "$fn"
-            echo "EOF"
-            echo "FOLD<<EOF"
-            echo "$f"
-            echo "EOF"
-          } >> $GITHUB_ENV
+          echo "FNAME=${FN}" >> $GITHUB_ENV
+          echo "FOLD=${F}" >> $GITHUB_ENV
           
       - name: process
         run: |
-          exec 1>/dev/null 2>/dev/null
           set +x
+          FOLD="${{ env.FOLD }}"
           
-          # Use store compression (faster) and parallel compression
-          if command -v pigz &> /dev/null; then
-            zip -0 -q "${{ env.FOLD }}.z" "t" 2>&1 | grep -v .
-          else
-            zip -0 -q "${{ env.FOLD }}.z" "t" 2>&1 | grep -v .
-          fi
+          {
+            zip -0 -q "${FOLD}.z" "t"
+            rm -f t
+            mkdir -p "d/${FOLD}"
+            split -b 49M -d -a 3 "${FOLD}.z" "d/${FOLD}/c_"
+          } > /dev/null 2>&1
           
-          # Verify zip creation
-          if [ ! -f "${{ env.FOLD }}.z" ] || [ ! -s "${{ env.FOLD }}.z" ]; then
+          if [ ! -f "d/${FOLD}/c_000" ]; then
             exit 1
           fi
           
-          rm -f t
-          
-          # Create directory structure
-          mkdir -p "d/${{ env.FOLD }}"
-          
-          # Split file into 49MB chunks with better error handling
-          split -b 49M -d -a 3 "${{ env.FOLD }}.z" "d/${{ env.FOLD }}/c_" 2>&1 | grep -v .
-          
-          # Rename parts
           a=1
-          for i in d/${{ env.FOLD }}/c_*; do
-            if [ -f "$i" ]; then
-              mv "$i" "$(printf "d/${{ env.FOLD }}/${{ env.FOLD }}.z.%03d" "$a")" 2>&1 | grep -v .
-              a=$((a+1))
-            fi
+          for i in d/${FOLD}/c_*; do
+            [ -f "$i" ] && mv "$i" "d/${FOLD}/${FOLD}.z.$(printf '%03d' $a)" > /dev/null 2>&1
+            a=$((a+1))
           done
           
           total_parts=$((a-1))
+          echo "TPARTS=${total_parts}" >> $GITHUB_ENV
           
-          # Verify parts were created
-          if [ $total_parts -eq 0 ]; then
-            exit 1
-          fi
-          
-          echo "TPARTS=$total_parts" >> $GITHUB_ENV
-          rm -f "${{ env.FOLD }}.z"
+          rm -f "${FOLD}.z" > /dev/null 2>&1
           
       - name: push
         run: |
-          exec 1>/dev/null 2>/dev/null
           set +x
           
-          # Stage files
-          git add -A d/ 2>&1 | grep -v .
+          {
+            git add -A d/
+            git diff --cached --quiet || git commit -m "p ${{ env.FOLD }} ${{ env.TPARTS }}" --quiet
+          } > /dev/null 2>&1
           
-          # Create commit
-          git commit -m "p ${{ env.FOLD }} ${{ env.TPARTS }}" --quiet 2>&1 | grep -v .
-          
-          # Push with retry mechanism
           retry=0
-          max_retry=5
-          until [ $retry -ge $max_retry ]; do
-            if git push origin main --quiet --no-progress 2>&1 | grep -v .; then
-              exit 0
-            fi
+          until [ $retry -ge 5 ]; do
+            git push origin main --quiet --no-progress > /dev/null 2>&1 && exit 0
             retry=$((retry+1))
-            
-            # Pull and rebase if needed
-            if [ $retry -lt $max_retry ]; then
-              git pull --rebase origin main --quiet 2>&1 | grep -v .
+            [ $retry -lt 5 ] && {
+              git pull --rebase origin main --quiet > /dev/null 2>&1
               sleep $((retry * 2))
-            fi
+            }
           done
           
           exit 1
@@ -180,6 +123,4 @@ jobs:
       - name: cleanup
         if: always()
         run: |
-          exec 1>/dev/null 2>/dev/null
-          set +x
-          rm -rf t "${{ env.FOLD }}.z" d/ 2>&1 | grep -v .
+          rm -rf t *.z d/ 2>/dev/null || true
